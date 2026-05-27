@@ -1,6 +1,9 @@
 .DS_Store
 .idea
 .venv
+__pycache__/
+*.pyc
 
 /src/camera_params.npz
+/dev/markers/
 /dev/img/markers/
