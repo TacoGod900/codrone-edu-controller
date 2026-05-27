@@ -23,6 +23,7 @@ WINDOW_HEIGHT = 720
 FPS = 30
 WIN_NAME = "Fingertip Zone Drone Control"
 MODEL_PATH = join(dirname(abspath(__file__)), "src", "hand_landmarker.task")
+SIM_DRONE_SPRITE_PATH = join(dirname(abspath(__file__)), "src", "drone_sprite.webp")
 
 THUMB_TIP_ID = 4
 INDEX_TIP_ID = 8
@@ -35,6 +36,8 @@ STEP_DISTANCE_M = 0.08
 STEP_DURATION_S = 0.18
 CONTROL_POWER = 25
 YAW_POWER = 30
+SIM_DRONE_SPEED_PX = 7
+SIM_DRONE_SIZE_PX = 92
 PINCH_ENTER_PX = 48
 PINCH_EXIT_PX = 72
 PINCH_DRAG_THRESHOLD_PX = 38
@@ -226,6 +229,89 @@ class PinchTracker:
         return info, (motion,) if motion else None
 
 
+class SimDroneSprite:
+    def __init__(self, sprite_path: str):
+        self.sprite_path = sprite_path
+        self.sprite = self._load_or_create_sprite(sprite_path)
+        self.x = 0.5
+        self.y = 0.5
+        self.last_size = None
+
+    def update(self, motions: Optional[Tuple[str, ...]], width: int, height: int, enabled: bool):
+        self.last_size = (width, height)
+        if not enabled:
+            return
+
+        dx = 0
+        dy = 0
+        for motion in motions or ():
+            if motion == "Left":
+                dx -= SIM_DRONE_SPEED_PX
+            elif motion == "Right":
+                dx += SIM_DRONE_SPEED_PX
+            elif motion in ("Up", "Forward"):
+                dy -= SIM_DRONE_SPEED_PX
+            elif motion in ("Down", "Back"):
+                dy += SIM_DRONE_SPEED_PX
+
+        px = self.x * width + dx
+        py = self.y * height + dy
+        margin = SIM_DRONE_SIZE_PX // 2 + 8
+        self.x = float(np.clip(px, margin, width - margin) / width)
+        self.y = float(np.clip(py, margin, height - margin) / height)
+
+    def draw(self, frame: np.ndarray, enabled: bool):
+        if not enabled:
+            return
+
+        H, W = frame.shape[:2]
+        cx = int(self.x * W)
+        cy = int(self.y * H)
+        size = min(SIM_DRONE_SIZE_PX, max(48, min(W, H) // 5))
+        sprite = cv2.resize(self.sprite, (size, size), interpolation=cv2.INTER_AREA)
+        x1 = max(0, cx - size // 2)
+        y1 = max(0, cy - size // 2)
+        x2 = min(W, x1 + size)
+        y2 = min(H, y1 + size)
+        sprite = sprite[: y2 - y1, : x2 - x1]
+
+        if sprite.shape[2] == 4:
+            alpha = sprite[:, :, 3:4].astype(np.float32) / 255.0
+            frame[y1:y2, x1:x2] = (sprite[:, :, :3] * alpha + frame[y1:y2, x1:x2] * (1.0 - alpha)).astype(np.uint8)
+        else:
+            frame[y1:y2, x1:x2] = sprite[:, :, :3]
+
+    def _load_or_create_sprite(self, sprite_path: str) -> np.ndarray:
+        sprite = cv2.imread(sprite_path, cv2.IMREAD_UNCHANGED)
+        if sprite is not None and sprite.ndim == 3 and sprite.shape[2] == 4:
+            return sprite
+        if sprite is not None and sprite.ndim == 3:
+            alpha = np.full(sprite.shape[:2] + (1,), 255, dtype=np.uint8)
+            return np.dstack((sprite[:, :, :3], alpha))
+
+        sprite = np.zeros((160, 160, 4), dtype=np.uint8)
+        body = (70, 235, 110, 255)
+        dark = (30, 40, 48, 255)
+        light = (245, 245, 245, 255)
+        accent = (255, 185, 80, 255)
+
+        cv2.line(sprite, (42, 42), (118, 118), dark, 8, cv2.LINE_AA)
+        cv2.line(sprite, (118, 42), (42, 118), dark, 8, cv2.LINE_AA)
+        cv2.circle(sprite, (80, 80), 24, body, -1, cv2.LINE_AA)
+        cv2.circle(sprite, (80, 80), 12, light, -1, cv2.LINE_AA)
+        for cx, cy in ((34, 34), (126, 34), (34, 126), (126, 126)):
+            cv2.circle(sprite, (cx, cy), 24, accent, 4, cv2.LINE_AA)
+            cv2.circle(sprite, (cx, cy), 12, light, 2, cv2.LINE_AA)
+
+        try:
+            fallback_path = join(dirname(sprite_path), "drone_sprite_fallback.png")
+            cv2.imwrite(fallback_path, sprite)
+            print(f"[SIM] Could not load drone photo. Created fallback sprite: {fallback_path}")
+        except Exception as exc:
+            print(f"[SIM] Could not save fallback drone sprite PNG: {exc}")
+        return sprite
+
+
 class DroneController:
     def __init__(self):
         self.drone = None
@@ -254,6 +340,9 @@ class DroneController:
             self.state = "sim"
             self.drone = None
             print(f"[SIM] Drone pairing failed: {exc}")
+
+    def is_simulated(self) -> bool:
+        return self.drone is None
 
     def takeoff(self):
         self.queue.put(("takeoff", None))
@@ -727,6 +816,7 @@ def main():
     cv2.namedWindow(WIN_NAME)
     smoother = FingertipSmoother(TIP_SMOOTHING)
     pinch_tracker = PinchTracker()
+    sim_drone = SimDroneSprite(SIM_DRONE_SPRITE_PATH)
     motion_debouncer = ZoneDebouncer(ZONE_DEBOUNCE_S)
     icon_dwell = IconDwell(ICON_DWELL_S)
     last_requested_motion = object()
@@ -803,7 +893,9 @@ def main():
                 controller.set_motion(requested_motion)
                 last_requested_motion = requested_motion
 
+            sim_drone.update(requested_motion, W, H, controller.is_simulated())
             draw_overlay(frame, zones, icons, dead, tips, command_motion, hovered_motion, pinch, active_icon, icon_progress, controller.state)
+            sim_drone.draw(frame, controller.is_simulated())
             cv2.imshow(WIN_NAME, frame)
     finally:
         controller.stop()

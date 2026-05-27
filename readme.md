@@ -116,6 +116,16 @@ Simulation mode is used when:
 
 In simulation mode, the camera UI still works and the terminal prints `[SIM]` output instead of flying a drone.
 
+The app also shows the drone photo at `src/drone_sprite.webp` in the camera window. Movement commands move the photo around the screen:
+
+| Command | Sprite movement |
+|---------|-----------------|
+| `Up` or `Forward` | Up |
+| `Down` or `Back` | Down |
+| `Left` | Left |
+| `Right` | Right |
+| Pinch rotate | No sprite rotation |
+
 ## Camera Calibration Tools
 
 The `dev/` folder contains helper scripts from the original OpenCV AR setup:
