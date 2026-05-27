@@ -63,7 +63,7 @@ If the drone is connected, the app will try to pair with it. If pairing fails, i
 
 ## Controls
 
-The app tracks only the index fingertip for each hand.
+The app uses the index fingertip for screen zones. It also watches the thumb and index fingertip together for pinch rotation.
 
 | Hand | Controls |
 |------|----------|
@@ -77,6 +77,15 @@ You can hover over two movement controls at the same time, for example `Up + For
 [COMMAND] Up + Forward
 [SIM] motion Up + Forward
 ```
+
+To rotate, pinch your thumb and index fingertip together. The app marks where the pinch started, then draws an arrow from that start point to the current pinch position. Keep pinching and drag left or right:
+
+| Gesture | Action |
+|---------|--------|
+| Pinch + drag left | Rotate left |
+| Pinch + drag right | Rotate right |
+
+While the pinch is active, normal movement zones are paused so the rotate gesture does not accidentally trigger forward/left/right movement.
 
 ## Top Buttons
 

@@ -24,16 +24,25 @@ FPS = 30
 WIN_NAME = "Fingertip Zone Drone Control"
 MODEL_PATH = join(dirname(abspath(__file__)), "src", "hand_landmarker.task")
 
-CONTROL_FINGERTIP_ID = 8
+THUMB_TIP_ID = 4
+INDEX_TIP_ID = 8
 TIP_SMOOTHING = 0.45
 ZONE_DEBOUNCE_S = 0.13
 ICON_DWELL_S = 0.60
 COMMAND_TICK_S = 0.12
-STEP_COOLDOWN_S = 0.55
-STEP_DISTANCE_M = 0.25
-STEP_DURATION_S = 0.7
+STEP_COOLDOWN_S = 0.20
+STEP_DISTANCE_M = 0.08
+STEP_DURATION_S = 0.18
 CONTROL_POWER = 25
-MOTION_NAMES = ("Up", "Down", "Forward", "Back", "Left", "Right")
+YAW_POWER = 30
+PINCH_ENTER_PX = 48
+PINCH_EXIT_PX = 72
+PINCH_DRAG_THRESHOLD_PX = 38
+MOTION_NAMES = ("Up", "Down", "Forward", "Back", "Left", "Right", "YawLeft", "YawRight")
+MOTION_LABELS = {
+    "YawLeft": "Rotate Left",
+    "YawRight": "Rotate Right",
+}
 
 COL_BG = (22, 24, 28)
 COL_GRID = (245, 245, 245)
@@ -69,6 +78,19 @@ class Fingertip:
     idx: int
     x: int
     y: int
+
+
+@dataclass
+class PinchInfo:
+    hand: str
+    thumb: Tuple[int, int]
+    index: Tuple[int, int]
+    anchor: Tuple[int, int]
+    mid: Tuple[int, int]
+    distance: float
+    active: bool
+    drag_dx: int
+    motion: Optional[str]
 
 
 class ZoneDebouncer:
@@ -144,6 +166,66 @@ class FingertipSmoother:
         return smoothed
 
 
+class PinchTracker:
+    def __init__(self):
+        self.active_hand = None
+        self.anchor = (0, 0)
+
+    def update(self, points: List[Fingertip]) -> Tuple[Optional[PinchInfo], Optional[Tuple[str, ...]]]:
+        by_hand = {}
+        for point in points:
+            by_hand.setdefault(point.hand, {})[point.idx] = point
+
+        candidates = []
+        for hand, hand_points in by_hand.items():
+            thumb = hand_points.get(THUMB_TIP_ID)
+            index = hand_points.get(INDEX_TIP_ID)
+            if thumb is None or index is None:
+                continue
+
+            distance = float(np.hypot(index.x - thumb.x, index.y - thumb.y))
+            mid = ((thumb.x + index.x) // 2, (thumb.y + index.y) // 2)
+            candidates.append((hand, thumb, index, mid, distance))
+
+        active_candidate = None
+        if self.active_hand:
+            active_candidate = next((c for c in candidates if c[0] == self.active_hand), None)
+            if active_candidate is None or active_candidate[4] > PINCH_EXIT_PX:
+                self.active_hand = None
+                active_candidate = None
+
+        if self.active_hand is None:
+            close_candidates = [c for c in candidates if c[4] <= PINCH_ENTER_PX]
+            if close_candidates:
+                active_candidate = min(close_candidates, key=lambda c: c[4])
+                self.active_hand = active_candidate[0]
+                self.anchor = active_candidate[3]
+
+        if active_candidate is None:
+            return None, None
+
+        hand, thumb, index, mid, distance = active_candidate
+        drag_dx = mid[0] - self.anchor[0]
+        motion = None
+        if drag_dx <= -PINCH_DRAG_THRESHOLD_PX:
+            motion = "YawLeft"
+        elif drag_dx >= PINCH_DRAG_THRESHOLD_PX:
+            motion = "YawRight"
+
+        info = PinchInfo(
+            hand=hand,
+            thumb=(thumb.x, thumb.y),
+            index=(index.x, index.y),
+            anchor=self.anchor,
+            mid=mid,
+            distance=distance,
+            active=True,
+            drag_dx=drag_dx,
+            motion=motion,
+        )
+        return info, (motion,) if motion else None
+
+
 class DroneController:
     def __init__(self):
         self.drone = None
@@ -152,6 +234,7 @@ class DroneController:
         self.worker = Thread(target=self._run, daemon=True)
         self.running = True
         self.current_motion = None
+        self.motion_token = 0
         self.last_step_at = 0.0
         self.worker.start()
 
@@ -176,18 +259,48 @@ class DroneController:
         self.queue.put(("takeoff", None))
 
     def land(self):
+        self.motion_token += 1
+        self.current_motion = None
+        self._clear_pending_commands()
         self.queue.put(("land", None))
 
     def stop(self):
+        self.motion_token += 1
+        self.current_motion = None
+        self._clear_pending_commands()
         self.queue.put(("stop", None))
 
     def set_motion(self, motion: Optional[Tuple[str, ...]]):
-        self.queue.put(("motion", motion))
+        self.motion_token += 1
+        token = self.motion_token
+        if motion is None:
+            self.current_motion = None
+            self._clear_pending_motion_commands()
+        self.queue.put(("motion", (token, motion)))
 
     def close(self):
         self.running = False
         self.queue.put(("close", None))
         self.worker.join(timeout=1.0)
+
+    def _clear_pending_commands(self):
+        while True:
+            try:
+                self.queue.get_nowait()
+            except Empty:
+                break
+
+    def _clear_pending_motion_commands(self):
+        keep = []
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except Empty:
+                break
+            if item[0] != "motion":
+                keep.append(item)
+        for item in keep:
+            self.queue.put(item)
 
     def _run(self):
         while self.running:
@@ -211,12 +324,17 @@ class DroneController:
             self.current_motion = None
             self._stop_motion()
         elif kind == "motion":
+            token, motion = value
+            if token != self.motion_token:
+                return
+            value = motion
+            if value is None:
+                self.current_motion = None
+                self._stop_motion()
+                return
             if value != self.current_motion:
                 self.current_motion = value
-                if value is None:
-                    self._stop_motion()
-                else:
-                    self._send_motion_tick(force=True)
+                self._send_motion_tick(force=True)
 
     def _takeoff(self):
         if self.state == "flying":
@@ -251,7 +369,10 @@ class DroneController:
             print("[SIM] stop")
             return
 
-        for name in ("hover", "stop", "emergency_stop"):
+        self.last_step_at = 0.0
+        neutral_sent = self._try_continuous_motion(None)
+
+        for name in ("hover", "stop"):
             method = getattr(self.drone, name, None)
             if callable(method):
                 try:
@@ -265,7 +386,8 @@ class DroneController:
                     print(f"[DRONE] {name} failed: {exc}")
                     return
 
-        self._try_continuous_motion(None)
+        if not neutral_sent:
+            print("[DRONE] no hover/stop method found; neutral command attempted")
         if self.state == "flying":
             self.state = "paused"
 
@@ -310,6 +432,10 @@ class DroneController:
             setters["set_throttle"] = CONTROL_POWER
         elif "Down" in motions:
             setters["set_throttle"] = -CONTROL_POWER
+        if "YawRight" in motions:
+            setters["set_yaw"] = YAW_POWER
+        elif "YawLeft" in motions:
+            setters["set_yaw"] = -YAW_POWER
         unknown = [name for name in motions if name not in MOTION_NAMES]
         if unknown:
             return False
@@ -353,11 +479,35 @@ class DroneController:
             vec[1] += delta[1]
             vec[2] += delta[2]
         if vec == [0.0, 0.0, 0.0]:
+            if "YawLeft" in motions:
+                self._fallback_turn("left")
+            elif "YawRight" in motions:
+                self._fallback_turn("right")
             return
         try:
             self.drone.move_distance(vec[0], vec[1], vec[2], STEP_DURATION_S)
         except Exception as exc:
             print(f"[DRONE] step move failed: {exc}")
+
+    def _fallback_turn(self, direction: str):
+        method_names = ("turn_left", "rotate_left") if direction == "left" else ("turn_right", "rotate_right")
+        for name in method_names:
+            method = getattr(self.drone, name, None)
+            if callable(method):
+                try:
+                    method(12)
+                    return
+                except TypeError:
+                    try:
+                        method()
+                        return
+                    except Exception as exc:
+                        print(f"[DRONE] {name} failed: {exc}")
+                        return
+                except Exception as exc:
+                    print(f"[DRONE] {name} failed: {exc}")
+                    return
+        print(f"[DRONE] no fallback turn method found for {direction}")
 
 
 def build_layout(width: int, height: int):
@@ -425,7 +575,7 @@ def _zone_priority(name: str) -> int:
 def _format_motion(motions: Optional[Tuple[str, ...]]) -> str:
     if not motions:
         return "Idle"
-    return " + ".join(motions)
+    return " + ".join(MOTION_LABELS.get(motion, motion) for motion in motions)
 
 
 def detect_motion_candidate(
@@ -491,12 +641,17 @@ def extract_fingertips(result, width: int, height: int) -> List[Fingertip]:
         # back to the user's real hand for the on-screen control mapping.
         hand_label = "Right" if hand_label == "Left" else "Left"
 
-        lm = hand[CONTROL_FINGERTIP_ID]
-        x = int(np.clip(lm.x * width, 0, width - 1))
-        y = int(np.clip(lm.y * height, 0, height - 1))
-        tips.append(Fingertip(hand_label, CONTROL_FINGERTIP_ID, x, y))
+        for idx in (THUMB_TIP_ID, INDEX_TIP_ID):
+            lm = hand[idx]
+            x = int(np.clip(lm.x * width, 0, width - 1))
+            y = int(np.clip(lm.y * height, 0, height - 1))
+            tips.append(Fingertip(hand_label, idx, x, y))
 
     return tips
+
+
+def index_tips_only(tips: List[Fingertip]) -> List[Fingertip]:
+    return [tip for tip in tips if tip.idx == INDEX_TIP_ID]
 
 
 def draw_overlay(
@@ -507,6 +662,7 @@ def draw_overlay(
     tips: List[Fingertip],
     active_motion: Optional[Tuple[str, ...]],
     hovered_motion: Tuple[str, ...],
+    pinch: Optional[PinchInfo],
     active_icon: Optional[str],
     icon_progress: float,
     drone_state: str,
@@ -522,17 +678,25 @@ def draw_overlay(
             fill_w = int((icon.x2 - icon.x1) * icon_progress)
             cv2.rectangle(frame, (icon.x1, icon.y2 - 6), (icon.x1 + fill_w, icon.y2), COL_ACTIVE, -1)
 
-    for tip in tips:
+    for tip in index_tips_only(tips):
         color = COL_LEFT_TIP if tip.hand == "Left" else COL_RIGHT_TIP
         cv2.circle(frame, (tip.x, tip.y), 6, color, -1, cv2.LINE_AA)
         cv2.circle(frame, (tip.x, tip.y), 9, COL_TEXT, 1, cv2.LINE_AA)
 
+    if pinch:
+        line_color = COL_ACTIVE if pinch.motion else (255, 220, 120)
+        cv2.arrowedLine(frame, pinch.anchor, pinch.mid, line_color, 4, cv2.LINE_AA, tipLength=0.18)
+        cv2.circle(frame, pinch.anchor, 8, COL_TEXT, 2, cv2.LINE_AA)
+        cv2.circle(frame, pinch.mid, 10, COL_TEXT, 2, cv2.LINE_AA)
+        direction = MOTION_LABELS.get(pinch.motion, "Pinch")
+        cv2.putText(frame, f"{direction}  dx={pinch.drag_dx}", (pinch.mid[0] + 14, pinch.mid[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COL_TEXT, 2, cv2.LINE_AA)
+
     command = _format_motion(active_motion)
-    hover = _format_motion(hovered_motion) if hovered_motion else active_icon or "None"
+    hover = _format_motion(hovered_motion) if hovered_motion else active_icon or ("Pinch" if pinch else "None")
     cv2.putText(frame, f"Command: {command}", (18, H - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.72, COL_TEXT, 2, cv2.LINE_AA)
     cv2.putText(frame, f"Hover: {hover}", (18, H - 78), cv2.FONT_HERSHEY_SIMPLEX, 0.62, COL_TEXT, 2, cv2.LINE_AA)
     cv2.putText(frame, f"Drone: {drone_state}", (18, H - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62, COL_TEXT, 2, cv2.LINE_AA)
-    cv2.putText(frame, "Index fingertip only  T=takeoff  Space=stop  L=land  Q/Esc=quit", (W - 590, H - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, COL_DIM, 1, cv2.LINE_AA)
+    cv2.putText(frame, "Index zones  Pinch+drag=rotate  T=takeoff  Space=stop  L=land  Q/Esc=quit", (W - 690, H - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.52, COL_DIM, 1, cv2.LINE_AA)
 
 
 def main():
@@ -562,6 +726,7 @@ def main():
 
     cv2.namedWindow(WIN_NAME)
     smoother = FingertipSmoother(TIP_SMOOTHING)
+    pinch_tracker = PinchTracker()
     motion_debouncer = ZoneDebouncer(ZONE_DEBOUNCE_S)
     icon_dwell = IconDwell(ICON_DWELL_S)
     last_requested_motion = object()
@@ -597,9 +762,11 @@ def main():
 
             raw_tips = extract_fingertips(result, W, H)
             tips = smoother.update(raw_tips)
+            control_tips = index_tips_only(tips)
+            pinch, pinch_motion = pinch_tracker.update(tips)
             now = time.monotonic()
 
-            active_icon = detect_icon(tips, icons)
+            active_icon = detect_icon(control_tips, icons)
             fired_icon, icon_progress = icon_dwell.update(active_icon, now)
             if fired_icon == "Takeoff":
                 print("[ICON] Takeoff dwell complete")
@@ -613,11 +780,13 @@ def main():
                 should_exit = True
                 continue
 
-            hovered_motion = () if active_icon else detect_hovered_zones(tips, zones)
-            candidate = None if active_icon else detect_motion_candidate(tips, zones, motion_debouncer.active)
+            zone_controls_enabled = active_icon is None and pinch is None
+            hovered_motion = () if not zone_controls_enabled else detect_hovered_zones(control_tips, zones)
+            candidate = None if not zone_controls_enabled else detect_motion_candidate(control_tips, zones, motion_debouncer.active)
             active_motion = motion_debouncer.update(candidate, now)
+            command_motion = pinch_motion if active_icon is None and pinch else active_motion
 
-            feedback = active_icon or hovered_motion
+            feedback = active_icon or pinch_motion or ("Pinch" if pinch else None) or hovered_motion
             if feedback != last_hover_feedback:
                 if feedback:
                     if isinstance(feedback, tuple):
@@ -628,13 +797,13 @@ def main():
                     print("[HOVER] Idle")
                 last_hover_feedback = feedback
 
-            requested_motion = None if active_icon else active_motion
+            requested_motion = None if active_icon else command_motion
             if requested_motion != last_requested_motion:
                 print(f"[COMMAND] {_format_motion(requested_motion)}")
                 controller.set_motion(requested_motion)
                 last_requested_motion = requested_motion
 
-            draw_overlay(frame, zones, icons, dead, tips, active_motion, hovered_motion, active_icon, icon_progress, controller.state)
+            draw_overlay(frame, zones, icons, dead, tips, command_motion, hovered_motion, pinch, active_icon, icon_progress, controller.state)
             cv2.imshow(WIN_NAME, frame)
     finally:
         controller.stop()
