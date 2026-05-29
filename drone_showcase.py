@@ -40,7 +40,7 @@ SIM_DRONE_SPEED_PX = 7
 SIM_DRONE_SIZE_PX = 92
 PINCH_ENTER_PX = 48
 PINCH_EXIT_PX = 72
-PINCH_DRAG_THRESHOLD_PX = 38
+PINCH_DRAG_THRESHOLD_PX = 100
 MOTION_NAMES = ("Up", "Down", "Forward", "Back", "Left", "Right", "YawLeft", "YawRight")
 MOTION_LABELS = {
     "YawLeft": "Rotate Left",
@@ -640,13 +640,13 @@ def draw_rect(frame: np.ndarray, rect: Rect, active: bool, alpha: float = 0.32):
     cx = (rect.x1 + rect.x2) // 2
     cy = (rect.y1 + rect.y2) // 2
     label = rect.symbol
-    scale = 1.2 if len(label) <= 1 else 0.72
-    thick = 3 if len(label) <= 1 else 2
+    scale = 1.6 if len(label) <= 1 else 0.9
+    thick = 4 if len(label) <= 1 else 2
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
     cv2.putText(frame, label, (cx - tw // 2, cy + th // 2), cv2.FONT_HERSHEY_SIMPLEX, scale, COL_TEXT, thick, cv2.LINE_AA)
 
     if rect.hand:
-        cv2.putText(frame, rect.name, (rect.x1 + 12, rect.y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_TEXT, 2, cv2.LINE_AA)
+        cv2.putText(frame, rect.name, (rect.x1 + 14, rect.y1 + 42), cv2.FONT_HERSHEY_SIMPLEX, 1.0, COL_TEXT, 3, cv2.LINE_AA)
 
 
 def detect_icon(tips: List[Fingertip], icons: List[Rect]) -> Optional[str]:
